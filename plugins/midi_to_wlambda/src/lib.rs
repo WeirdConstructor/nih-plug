@@ -40,6 +40,9 @@ pub struct Midi2WLambdaParams {
 
     #[persist = "wlambda-code"]
     wlambda_code: Arc<Mutex<String>>,
+
+    #[persist = "wlambda-path"]
+    wlambda_path: Arc<Mutex<String>>,
 }
 
 impl Default for Midi2WLambda {
@@ -63,6 +66,7 @@ impl Default for Midi2WLambdaParams {
         Self {
             editor_state: EguiState::from_size(800, 500),
             wlambda_code: Arc::new(Mutex::new(String::from("!(note, is_on) = @;\n"))),
+            wlambda_path: Arc::new(Mutex::new(String::from("/home/weicon/midi2wlambda.wl"))),
         }
     }
 }
@@ -123,6 +127,7 @@ impl Plugin for Midi2WLambda {
         std::thread::spawn(move || {
             let mut wlctx = EvalContext::new_default();
             handle.register_global_functions("worker", &mut wlctx);
+            let log2 = log.clone();
             wlctx.set_global_var(
                 "log",
                 &VValFun::new_fun(
@@ -137,7 +142,14 @@ impl Plugin for Midi2WLambda {
             );
             let _ = wlctx.eval("log :STARTUP_WLAMBDA");
 
-            let rr = wlctx.eval("!:global do_it = {|| std:displayln \"TEST\"; log _; 100 };");
+            let rr = wlctx.eval(r#"
+                !:global do_it = {|| std:displayln "TEST"; log _; 100 };
+                !:global on_midi = {||};
+                !:global update_midi_function = {!(code) = @;
+                    !func = std:eval code;
+                    .on_midi = unwrap func;
+                };
+            "#);
             if let Err(e) = rr {
                 eprintln!("RR: {}", e);
             }
@@ -150,15 +162,16 @@ impl Plugin for Midi2WLambda {
         });
 
         let sender = self.wl_handle.clone();
+        let log = self.gui_log_channel.clone();
 
         Box::new(move |bg: M2WTask| match bg {
             M2WTask::MIDI(x, o) => {
                 eprintln!("MIDI {} {}", x, o);
-                let _ = sender.call("do_it", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
+                let _ = sender.call("on_midi", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
             }
             M2WTask::UpdateCode(code) => {
-                eprintln!("UPDATE {}", code);
-                let r = sender.call("do_it", VVal::vec1(VVal::new_str_mv(code)));
+                let r = sender.call("update_midi_function", VVal::vec1(VVal::new_str_mv(code)));
+                log.send(&VVal::new_str_mv(format!("Updated! {}", r.s())));
                 eprintln!("RRR: {}", r.s());
             }
         })
@@ -183,9 +196,18 @@ impl Plugin for Midi2WLambda {
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     // NOTE: See `plugins/diopser/src/editor.rs` for an example using the generic UI widget
 
-                    if ui.button("Test").clicked() {
-                        async_executor
-                            .execute_background(M2WTask::UpdateCode("test123".to_string()));
+                    if let Ok(mut path) = params.wlambda_path.lock() {
+                        if ui.button("Update").clicked() {
+                            if let Ok(mut code) = params.wlambda_code.lock() {
+                                if let Ok(txt) = std::fs::read_to_string(&*path) {
+                                    *code = txt;
+                                    async_executor
+                                        .execute_background(M2WTask::UpdateCode(code.clone()));
+                                }
+                            }
+                        }
+
+                        ui.text_edit_singleline(&mut *path);
                     }
 
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
