@@ -40,6 +40,8 @@ members = [
   "plugins/puberty_simulator",
   "plugins/safety_limiter",
   "plugins/spectral_compressor",
+
+  "plugins/midi_to_wlambda",
 ]
 
 [features]

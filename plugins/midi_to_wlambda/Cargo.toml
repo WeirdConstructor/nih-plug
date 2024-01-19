@@ -1,0 +1,20 @@
+[package]
+name = "midi_to_wlambda"
+version = "0.1.0"
+edition = "2021"
+authors = ["Weird Constructor <weirdconstructor@m8geil.de>"]
+license = "ISC"
+
+description = "A plugin to route audio events and parameters to a WLambda script for controlling LEDs."
+
+[lib]
+# The `lib` artifact is needed for the standalone target
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+nih_plug = { path = "../../", features = ["assert_process_allocs", "standalone"] }
+nih_plug_egui = { path = "../../nih_plug_egui" }
+
+wlambda = { path = "../../../WLambda", features = ["default", "http", "clipboard", "zip"] }
+
+atomic_float = "0.1"
