@@ -1,6 +1,6 @@
 [package]
 name = "midi_to_wlambda"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Weird Constructor <weirdconstructor@m8geil.de>"]
 license = "ISC"

@@ -2,8 +2,11 @@ use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
 use std::sync::Arc;
+use std::sync::Mutex;
 use wlambda::rpc_helper::{RPCHandle, RPCHandleStopper};
-use wlambda::{EvalContext, VVal};
+use wlambda::threads::AValChannel;
+use wlambda::vval::VValFun;
+use wlambda::{Env, EvalContext, VVal};
 
 /// The time it takes for the peak meter to decay by 12 dB after switching to complete silence.
 const PEAK_METER_DECAY_MS: f64 = 150.0;
@@ -24,6 +27,8 @@ pub struct Midi2WLambda {
 
     wl_handle: RPCHandle,
     wl_handle_stopper: RPCHandleStopper,
+
+    gui_log_channel: AValChannel,
 }
 
 #[derive(Params)]
@@ -33,12 +38,8 @@ pub struct Midi2WLambdaParams {
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
 
-    #[id = "gain"]
-    pub gain: FloatParam,
-
-    // TODO: Remove this parameter when we're done implementing the widgets
-    #[id = "foobar"]
-    pub some_int: IntParam,
+    #[persist = "wlambda-code"]
+    wlambda_code: Arc<Mutex<String>>,
 }
 
 impl Default for Midi2WLambda {
@@ -50,6 +51,7 @@ impl Default for Midi2WLambda {
 
             peak_meter_decay_weight: 1.0,
             peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
+            gui_log_channel: AValChannel::new_direct(),
             wl_handle,
             wl_handle_stopper,
         }
@@ -59,30 +61,27 @@ impl Default for Midi2WLambda {
 impl Default for Midi2WLambdaParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(300, 180),
-
-            // See the main gain example for more details
-            gain: FloatParam::new(
-                "Gain",
-                util::db_to_gain(0.0),
-                FloatRange::Skewed {
-                    min: util::db_to_gain(-30.0),
-                    max: util::db_to_gain(30.0),
-                    factor: FloatRange::gain_skew_factor(-30.0, 30.0),
-                },
-            )
-            .with_smoother(SmoothingStyle::Logarithmic(50.0))
-            .with_unit(" dB")
-            .with_value_to_string(formatters::v2s_f32_gain_to_db(2))
-            .with_string_to_value(formatters::s2v_f32_gain_to_db()),
-            some_int: IntParam::new("Something", 3, IntRange::Linear { min: 0, max: 3 }),
+            editor_state: EguiState::from_size(800, 500),
+            wlambda_code: Arc::new(Mutex::new(String::from("!(note, is_on) = @;\n"))),
         }
     }
 }
 
 pub enum M2WTask {
-    MIDI(i64),
+    MIDI(i64, bool),
     UpdateCode(String),
+}
+
+struct GUIState {
+    log: String,
+}
+
+impl GUIState {
+    fn new() -> Self {
+        Self {
+            log: String::from(""),
+        }
+    }
 }
 
 impl Plugin for Midi2WLambda {
@@ -106,6 +105,8 @@ impl Plugin for Midi2WLambda {
         },
     ];
 
+    const MIDI_INPUT: MidiConfig = MidiConfig::Basic;
+
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
@@ -117,11 +118,29 @@ impl Plugin for Midi2WLambda {
 
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let handle = self.wl_handle.clone();
+        let log = self.gui_log_channel.clone();
 
         std::thread::spawn(move || {
             let mut wlctx = EvalContext::new_default();
             handle.register_global_functions("worker", &mut wlctx);
-            let _ = wlctx.eval("!:global do_it = { std:displayln \"TEST\"; 100 };");
+            wlctx.set_global_var(
+                "log",
+                &VValFun::new_fun(
+                    move |env: &mut Env, _argc: usize| {
+                        log.send(&env.arg(0));
+                        Ok(VVal::None)
+                    },
+                    Some(1),
+                    Some(1),
+                    false,
+                ),
+            );
+            let _ = wlctx.eval("log :STARTUP_WLAMBDA");
+
+            let rr = wlctx.eval("!:global do_it = {|| std:displayln \"TEST\"; log _; 100 };");
+            if let Err(e) = rr {
+                eprintln!("RR: {}", e);
+            }
 
             wlambda::rpc_helper::rpc_handler(
                 &mut wlctx,
@@ -133,12 +152,14 @@ impl Plugin for Midi2WLambda {
         let sender = self.wl_handle.clone();
 
         Box::new(move |bg: M2WTask| match bg {
-            M2WTask::MIDI(x) => {
-                eprintln!("MIDI {}", x);
+            M2WTask::MIDI(x, o) => {
+                eprintln!("MIDI {} {}", x, o);
+                let _ = sender.call("do_it", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
             }
             M2WTask::UpdateCode(code) => {
-                let res = sender.call("do_it", VVal::None);
-                eprintln!("UPDATE {} = {}", code, res.s());
+                eprintln!("UPDATE {}", code);
+                let r = sender.call("do_it", VVal::vec1(VVal::new_str_mv(code)));
+                eprintln!("RRR: {}", r.s());
             }
         })
     }
@@ -146,66 +167,87 @@ impl Plugin for Midi2WLambda {
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let peak_meter = self.peak_meter.clone();
+        let chan = self.gui_log_channel.clone();
+
         create_egui_editor(
             self.params.editor_state.clone(),
-            (),
+            GUIState::new(),
             |_, _| {},
-            move |egui_ctx, setter, _state| {
+            move |egui_ctx, setter, state| {
+                let mut r = chan.try_recv();
+                while r.is_some() {
+                    state.log = state.log.clone() + "\n" + &r.s_raw();
+                    r = chan.try_recv();
+                }
+
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     // NOTE: See `plugins/diopser/src/editor.rs` for an example using the generic UI widget
 
-                    // This is a fancy widget that can get all the information it needs to properly
-                    // display and modify the parameter from the parametr itself
-                    // It's not yet fully implemented, as the text is missing.
-                    ui.label("Some random integer");
-                    ui.add(widgets::ParamSlider::for_param(&params.some_int, setter));
-
-                    if params.some_int.value() == 1 {
+                    if ui.button("Test").clicked() {
                         async_executor
                             .execute_background(M2WTask::UpdateCode("test123".to_string()));
                     }
 
-                    ui.label("Gain");
-                    ui.add(widgets::ParamSlider::for_param(&params.gain, setter));
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        if let Ok(mut code) = params.wlambda_code.lock() {
+                            egui::ScrollArea::vertical().show(ui, |ui| {
+                                ui.add_sized(
+                                    ui.available_size() * egui::Vec2::new(0.5, 1.0),
+                                    egui::TextEdit::multiline(&mut *code)
+                                        .code_editor()
+                                        .desired_width(40.0)
+                                        .desired_rows(50)
+                                );
+                            });
+                        }
 
-                    ui.label(
-                        "Also gain, but with a lame widget. Can't even render the value correctly!",
-                    );
-                    // This is a simple naieve version of a parameter slider that's not aware of how
-                    // the parameters work
-                    ui.add(
-                        egui::widgets::Slider::from_get_set(-30.0..=30.0, |new_value| {
-                            match new_value {
-                                Some(new_value_db) => {
-                                    let new_value = util::gain_to_db(new_value_db as f32);
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.add_sized(
+                                ui.available_size(),
+                                egui::TextEdit::multiline(&mut state.log)
+                                    .code_editor()
+                                    .desired_width(40.0)
+                                    .desired_rows(50)
+                            );
+                        });
+                    });
 
-                                    setter.begin_set_parameter(&params.gain);
-                                    setter.set_parameter(&params.gain, new_value);
-                                    setter.end_set_parameter(&params.gain);
-
-                                    new_value_db
-                                }
-                                None => util::gain_to_db(params.gain.value()) as f64,
-                            }
-                        })
-                        .suffix(" dB"),
-                    );
-
-                    // TODO: Add a proper custom widget instead of reusing a progress bar
-                    let peak_meter =
-                        util::gain_to_db(peak_meter.load(std::sync::atomic::Ordering::Relaxed));
-                    let peak_meter_text = if peak_meter > util::MINUS_INFINITY_DB {
-                        format!("{peak_meter:.1} dBFS")
-                    } else {
-                        String::from("-inf dBFS")
-                    };
-
-                    let peak_meter_normalized = (peak_meter + 60.0) / 60.0;
-                    ui.allocate_space(egui::Vec2::splat(2.0));
-                    ui.add(
-                        egui::widgets::ProgressBar::new(peak_meter_normalized)
-                            .text(peak_meter_text),
-                    );
+                    //                    // This is a fancy widget that can get all the information it needs to properly
+                    //                    // display and modify the parameter from the parametr itself
+                    //                    // It's not yet fully implemented, as the text is missing.
+                    //                    ui.label("Some random integer");
+                    //                    ui.add(widgets::ParamSlider::for_param(&params.some_int, setter));
+                    //
+                    //                    if params.some_int.value() == 1 {
+                    //                        async_executor
+                    //                            .execute_background(M2WTask::UpdateCode("test123".to_string()));
+                    //                    }
+                    //
+                    //                    ui.label("Gain");
+                    //                    ui.add(widgets::ParamSlider::for_param(&params.gain, setter));
+                    //
+                    //                    ui.label(
+                    //                        "Also gain, but with a lame widget. Can't even render the value correctly!",
+                    //                    );
+                    //                    // This is a simple naieve version of a parameter slider that's not aware of how
+                    //                    // the parameters work
+                    //                    ui.add(
+                    //                        egui::widgets::Slider::from_get_set(-30.0..=30.0, |new_value| {
+                    //                            match new_value {
+                    //                                Some(new_value_db) => {
+                    //                                    let new_value = util::gain_to_db(new_value_db as f32);
+                    //
+                    //                                    setter.begin_set_parameter(&params.gain);
+                    //                                    setter.set_parameter(&params.gain, new_value);
+                    //                                    setter.end_set_parameter(&params.gain);
+                    //
+                    //                                    new_value_db
+                    //                                }
+                    //                                None => util::gain_to_db(params.gain.value()) as f64,
+                    //                            }
+                    //                        })
+                    //                        .suffix(" dB"),
+                    //                    );
                 });
             },
         )
@@ -228,35 +270,25 @@ impl Plugin for Midi2WLambda {
 
     fn process(
         &mut self,
-        buffer: &mut Buffer,
+        _buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
-        for channel_samples in buffer.iter_samples() {
-            let mut amplitude = 0.0;
-            let num_samples = channel_samples.len();
+        let mut next_event = context.next_event();
 
-            let gain = self.params.gain.smoothed.next();
-            for sample in channel_samples {
-                *sample *= gain;
-                amplitude += *sample;
+        while let Some(event) = next_event {
+            match event {
+                NoteEvent::NoteOn { note, velocity, .. } => {
+                    context.execute_background(M2WTask::MIDI(note as i64, true));
+                }
+                NoteEvent::NoteOff { note, .. } => {
+                    context.execute_background(M2WTask::MIDI(note as i64, false));
+                }
+                NoteEvent::PolyVolume { note, gain, .. } => {}
+                _ => (),
             }
 
-            // To save resources, a plugin can (and probably should!) only perform expensive
-            // calculations that are only displayed on the GUI while the GUI is open
-            if self.params.editor_state.is_open() {
-                amplitude = (amplitude / num_samples as f32).abs();
-                let current_peak_meter = self.peak_meter.load(std::sync::atomic::Ordering::Relaxed);
-                let new_peak_meter = if amplitude > current_peak_meter {
-                    amplitude
-                } else {
-                    current_peak_meter * self.peak_meter_decay_weight
-                        + amplitude * (1.0 - self.peak_meter_decay_weight)
-                };
-
-                self.peak_meter
-                    .store(new_peak_meter, std::sync::atomic::Ordering::Relaxed)
-            }
+            next_event = context.next_event();
         }
 
         ProcessStatus::Normal
