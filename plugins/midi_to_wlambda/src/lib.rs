@@ -8,22 +8,10 @@ use wlambda::threads::AValChannel;
 use wlambda::vval::VValFun;
 use wlambda::{Env, EvalContext, VVal};
 
-/// The time it takes for the peak meter to decay by 12 dB after switching to complete silence.
-const PEAK_METER_DECAY_MS: f64 = 150.0;
-
 /// This is mostly identical to the gain example, minus some fluff, and with a GUI.
 #[allow(dead_code)]
 pub struct Midi2WLambda {
     params: Arc<Midi2WLambdaParams>,
-
-    /// Needed to normalize the peak meter's response based on the sample rate.
-    peak_meter_decay_weight: f32,
-    /// The current data for the peak meter. This is stored as an [`Arc`] so we can share it between
-    /// the GUI and the audio processing parts. If you have more state to share, then it's a good
-    /// idea to put all of that in a struct behind a single `Arc`.
-    ///
-    /// This is stored as voltage gain.
-    peak_meter: Arc<AtomicF32>,
 
     wl_handle: RPCHandle,
     wl_handle_stopper: RPCHandleStopper,
@@ -37,6 +25,12 @@ pub struct Midi2WLambdaParams {
     /// restored.
     #[persist = "editor-state"]
     editor_state: Arc<EguiState>,
+
+    #[persist = "wlambda-init-code"]
+    wlambda_init_code: Arc<Mutex<String>>,
+
+    #[persist = "wlambda-init-path"]
+    wlambda_init_path: Arc<Mutex<String>>,
 
     #[persist = "wlambda-code"]
     wlambda_code: Arc<Mutex<String>>,
@@ -52,8 +46,6 @@ impl Default for Midi2WLambda {
         Self {
             params: Arc::new(Midi2WLambdaParams::default()),
 
-            peak_meter_decay_weight: 1.0,
-            peak_meter: Arc::new(AtomicF32::new(util::MINUS_INFINITY_DB)),
             gui_log_channel: AValChannel::new_direct(),
             wl_handle,
             wl_handle_stopper,
@@ -64,9 +56,13 @@ impl Default for Midi2WLambda {
 impl Default for Midi2WLambdaParams {
     fn default() -> Self {
         Self {
-            editor_state: EguiState::from_size(800, 500),
+            editor_state: EguiState::from_size(1200, 500),
             wlambda_code: Arc::new(Mutex::new(String::from("!(note, is_on) = @;\n"))),
             wlambda_path: Arc::new(Mutex::new(String::from("/home/weicon/midi2wlambda.wl"))),
+            wlambda_init_code: Arc::new(Mutex::new(String::from(""))),
+            wlambda_init_path: Arc::new(Mutex::new(String::from(
+                "/home/weicon/midi2wlambda_init.wl",
+            ))),
         }
     }
 }
@@ -74,16 +70,17 @@ impl Default for Midi2WLambdaParams {
 pub enum M2WTask {
     MIDI(i64, bool),
     UpdateCode(String),
+    InitCode(String, String),
 }
 
 struct GUIState {
-    log: String,
+    log: Vec<String>,
 }
 
 impl GUIState {
     fn new() -> Self {
         Self {
-            log: String::from(""),
+            log: vec![],
         }
     }
 }
@@ -124,6 +121,9 @@ impl Plugin for Midi2WLambda {
         let handle = self.wl_handle.clone();
         let log = self.gui_log_channel.clone();
 
+        let comm_chan = AValChannel::new_direct();
+        let recv = comm_chan.clone();
+
         std::thread::spawn(move || {
             let mut wlctx = EvalContext::new_default();
             handle.register_global_functions("worker", &mut wlctx);
@@ -140,16 +140,27 @@ impl Plugin for Midi2WLambda {
                     false,
                 ),
             );
+
+            wlctx.set_global_var(
+                "new_log_sender",
+                &VValFun::new_fun(
+                    move |env: &mut Env, _argc: usize| Ok(log2.fork_sender()),
+                    Some(0),
+                    Some(0),
+                    false,
+                ),
+            );
             let _ = wlctx.eval("log :STARTUP_WLAMBDA");
 
-            let rr = wlctx.eval(r#"
-                !:global do_it = {|| std:displayln "TEST"; log _; 100 };
+            let rr = wlctx.eval(
+                r#"
                 !:global on_midi = {||};
                 !:global update_midi_function = {!(code) = @;
                     !func = std:eval code;
                     .on_midi = unwrap func;
                 };
-            "#);
+            "#,
+            );
             if let Err(e) = rr {
                 eprintln!("RR: {}", e);
             }
@@ -169,17 +180,31 @@ impl Plugin for Midi2WLambda {
                 eprintln!("MIDI {} {}", x, o);
                 let _ = sender.call("on_midi", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
             }
+            M2WTask::InitCode(init_code, midi_code) => {
+                let r = sender.eval(&init_code);
+                log.send(&VVal::new_str_mv(format!("Initialized! {}", r.s())));
+
+                let r = sender.call(
+                    "update_midi_function",
+                    VVal::vec1(VVal::new_str(&midi_code)),
+                );
+                log.send(&VVal::new_str_mv(format!(
+                    "Updated MIDI Function! {}",
+                    r.s()
+                )));
+            }
             M2WTask::UpdateCode(code) => {
-                let r = sender.call("update_midi_function", VVal::vec1(VVal::new_str_mv(code)));
-                log.send(&VVal::new_str_mv(format!("Updated! {}", r.s())));
-                eprintln!("RRR: {}", r.s());
+                let r = sender.call("update_midi_function", VVal::vec1(VVal::new_str(&code)));
+                log.send(&VVal::new_str_mv(format!(
+                    "Updated MIDI Function! {}",
+                    r.s()
+                )));
             }
         })
     }
 
     fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
-        let peak_meter = self.peak_meter.clone();
         let chan = self.gui_log_channel.clone();
 
         create_egui_editor(
@@ -189,50 +214,105 @@ impl Plugin for Midi2WLambda {
             move |egui_ctx, setter, state| {
                 let mut r = chan.try_recv();
                 while r.is_some() {
-                    state.log = state.log.clone() + "\n" + &r.s_raw();
+                    if state.log.len() > 100 {
+                        state.log.remove(0);
+                    }
+                    state.log.push(r.s_raw());
                     r = chan.try_recv();
                 }
 
                 egui::CentralPanel::default().show(egui_ctx, |ui| {
                     // NOTE: See `plugins/diopser/src/editor.rs` for an example using the generic UI widget
+                    ui.vertical(|ui| {
+                        if let Ok(mut path) = params.wlambda_path.lock() {
+                            if let Ok(mut init_path) = params.wlambda_init_path.lock() {
+                                if ui.button("Update Init").clicked() {
+                                    if let Ok(mut midi_code) = params.wlambda_code.lock() {
+                                        if let Ok(mut init_code) = params.wlambda_init_code.lock() {
+                                            if let Ok(m_code) = std::fs::read_to_string(&*path) {
+                                                *midi_code = m_code;
+                                            }
 
-                    if let Ok(mut path) = params.wlambda_path.lock() {
-                        if ui.button("Update").clicked() {
-                            if let Ok(mut code) = params.wlambda_code.lock() {
-                                if let Ok(txt) = std::fs::read_to_string(&*path) {
-                                    *code = txt;
-                                    async_executor
-                                        .execute_background(M2WTask::UpdateCode(code.clone()));
+                                            if let Ok(txt) = std::fs::read_to_string(&*init_path) {
+                                                *init_code = txt;
+
+                                                async_executor.execute_background(
+                                                    M2WTask::InitCode(
+                                                        init_code.clone(),
+                                                        midi_code.clone(),
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
+
+                                ui.text_edit_singleline(&mut *init_path);
                             }
                         }
 
-                        ui.text_edit_singleline(&mut *path);
-                    }
+                        if let Ok(mut path) = params.wlambda_path.lock() {
+                            if ui.button("Update Code").clicked() {
+                                if let Ok(mut code) = params.wlambda_code.lock() {
+                                    if let Ok(txt) = std::fs::read_to_string(&*path) {
+                                        *code = txt;
+                                        async_executor
+                                            .execute_background(M2WTask::UpdateCode(code.clone()));
+                                    }
+                                }
+                            }
 
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
-                        if let Ok(mut code) = params.wlambda_code.lock() {
-                            egui::ScrollArea::vertical().show(ui, |ui| {
-                                ui.add_sized(
-                                    ui.available_size() * egui::Vec2::new(0.5, 1.0),
-                                    egui::TextEdit::multiline(&mut *code)
-                                        .code_editor()
-                                        .desired_width(40.0)
-                                        .desired_rows(50)
-                                );
-                            });
+                            ui.text_edit_singleline(&mut *path);
                         }
 
-                        egui::ScrollArea::vertical().show(ui, |ui| {
-                            ui.add_sized(
-                                ui.available_size(),
-                                egui::TextEdit::multiline(&mut state.log)
-                                    .code_editor()
-                                    .desired_width(40.0)
-                                    .desired_rows(50)
-                            );
+                        ui.columns(3, |columns| {
+                            if let Ok(mut code) = params.wlambda_init_code.lock() {
+                                egui::ScrollArea::vertical().id_source("init").show(
+                                    &mut columns[0],
+                                    |ui| {
+                                        ui.add_sized(
+                                            ui.available_size() * egui::Vec2::new(0.3, 1.0),
+                                            egui::TextEdit::multiline(&mut *code)
+                                                .code_editor()
+                                                .desired_width(40.0)
+                                                .desired_rows(29),
+                                        );
+                                    },
+                                );
+                            }
+
+                            if let Ok(mut code) = params.wlambda_code.lock() {
+                                egui::ScrollArea::vertical().id_source("code").show(
+                                    &mut columns[1],
+                                    |ui| {
+                                        ui.add_sized(
+                                            ui.available_size() * egui::Vec2::new(0.3, 1.0),
+                                            egui::TextEdit::multiline(&mut *code)
+                                                .code_editor()
+                                                .desired_width(40.0)
+                                                .desired_rows(29),
+                                        );
+                                    },
+                                );
+                            }
+
+                            let log_str = state.log.join("\n");
+                            let mut llstr : &str = &log_str;
+
+                            egui::ScrollArea::vertical()
+                                .id_source("log")
+                                .stick_to_bottom(true)
+                                .show(&mut columns[2], |ui| {
+                                    ui.add_sized(
+                                        ui.available_size(),
+                                        egui::TextEdit::multiline(&mut llstr)
+                                            .code_editor()
+                                            .desired_width(40.0)
+                                            .desired_rows(29),
+                                    );
+                                });
                         });
-                    });
+                    })
 
                     //                    // This is a fancy widget that can get all the information it needs to properly
                     //                    // display and modify the parameter from the parametr itself
@@ -281,12 +361,6 @@ impl Plugin for Midi2WLambda {
         buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
-        // After `PEAK_METER_DECAY_MS` milliseconds of pure silence, the peak meter's value should
-        // have dropped by 12 dB
-        self.peak_meter_decay_weight = 0.25f64
-            .powf((buffer_config.sample_rate as f64 * PEAK_METER_DECAY_MS / 1000.0).recip())
-            as f32;
-
         true
     }
 
@@ -324,13 +398,16 @@ impl ClapPlugin for Midi2WLambda {
     );
     const CLAP_MANUAL_URL: Option<&'static str> = Some(Self::URL);
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
-    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Utility];
+    const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Instrument, ClapFeature::Utility];
 }
 
 impl Vst3Plugin for Midi2WLambda {
     const VST3_CLASS_ID: [u8; 16] = *b"MIDI2WLambdaAAAA";
-    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] =
-        &[Vst3SubCategory::Fx, Vst3SubCategory::Tools];
+    const VST3_SUBCATEGORIES: &'static [Vst3SubCategory] = &[
+        Vst3SubCategory::Fx,
+        Vst3SubCategory::Instrument,
+        Vst3SubCategory::Tools,
+    ];
 }
 
 nih_export_clap!(Midi2WLambda);
