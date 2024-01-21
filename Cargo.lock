@@ -2450,7 +2450,7 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "socket2 0.4.10",
+ "socket2 0.5.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -3060,6 +3060,7 @@ dependencies = [
  "atomic_float",
  "nih_plug",
  "nih_plug_egui",
+ "rtrb 0.3.0",
  "wlambda",
 ]
 
@@ -3230,6 +3231,7 @@ dependencies = [
  "core-foundation",
  "cpal",
  "crossbeam",
+ "errno",
  "jack",
  "lazy_static",
  "libc",
@@ -3241,7 +3243,7 @@ dependencies = [
  "objc",
  "parking_lot 0.12.1",
  "raw-window-handle 0.5.2",
- "rtrb",
+ "rtrb 0.2.3",
  "serde",
  "serde_json",
  "vst3-sys",
@@ -4391,6 +4393,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "99e704dd104faf2326a320140f70f0b736d607c1caa1b1748a6c568a79819109"
 dependencies = [
  "cache-padded",
+]
+
+[[package]]
+name = "rtrb"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "636b228b5adb32add7f0e41e5084d38aa66fb0f942e8a91751c1e90023288fbe"
+dependencies = [
+ "crossbeam-utils",
 ]
 
 [[package]]

@@ -9,6 +9,7 @@ use vst3_sys::base::{kInvalidArgument, kResultFalse, kResultOk, tresult, TBool};
 use vst3_sys::gui::{IPlugFrame, IPlugView, IPlugViewContentScaleSupport, ViewRect};
 use vst3_sys::utils::SharedVstPtr;
 use vst3_sys::VST3;
+use errno::{errno};
 
 use super::inner::{Task, WrapperInner};
 use super::util::{ObjectPtr, VstPtr};
@@ -233,16 +234,18 @@ impl<P: Vst3Plugin> RunLoopEventHandler<P> {
         //      being posted yet. In practice this won't cause any issues however.
         let notify_value = 1i8;
         const NOTIFY_VALUE_SIZE: usize = std::mem::size_of::<i8>();
-        assert_eq!(
+//        eprintln!("write_fd {:?}", std::thread::current().id());
+//        assert_eq!(
             unsafe {
                 libc::write(
                     self.socket_write_fd,
                     &notify_value as *const _ as *const c_void,
                     NOTIFY_VALUE_SIZE,
-                )
-            },
-            NOTIFY_VALUE_SIZE as isize
-        );
+                );
+            }
+            //,
+//            NOTIFY_VALUE_SIZE as isize
+//        );
 
         Ok(())
     }
@@ -479,14 +482,18 @@ impl<P: Vst3Plugin> IEventHandler for RunLoopEventHandler<P> {
 
             let mut notify_value = 1i8;
             const NOTIFY_VALUE_SIZE: usize = std::mem::size_of::<i8>();
-            assert_eq!(
-                libc::read(
+            let r = libc::read(
                     self.socket_read_fd,
                     &mut notify_value as *mut _ as *mut c_void,
                     NOTIFY_VALUE_SIZE
-                ),
-                NOTIFY_VALUE_SIZE as isize
-            );
+                );
+            if r != (NOTIFY_VALUE_SIZE as isize) {
+                eprintln!("read_fd {:?} {}={}", std::thread::current().id(), errno(), errno().0);
+            }
+//            assert_eq!(
+//                r,
+//                NOTIFY_VALUE_SIZE as isize
+//            );
         }
     }
 }

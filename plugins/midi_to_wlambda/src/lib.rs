@@ -1,12 +1,82 @@
 use atomic_float::AtomicF32;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets, EguiState};
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::sync::Arc;
 use std::sync::Mutex;
 use wlambda::rpc_helper::{RPCHandle, RPCHandleStopper};
 use wlambda::threads::AValChannel;
-use wlambda::vval::VValFun;
-use wlambda::{Env, EvalContext, VVal};
+use wlambda::vval::{VValFun, VValUserData};
+use wlambda::{Env, EvalContext, StackAction, VVal};
+
+#[derive(Clone)]
+struct AtomicFloatVec {
+    v: Vec<Arc<AtomicF32>>,
+}
+
+impl AtomicFloatVec {
+    pub fn new(len: usize) -> Self {
+        let mut v = vec![];
+        for _ in 0..len {
+            v.push(Arc::new(AtomicF32::new(0.0)));
+        }
+        Self { v: v }
+    }
+
+    pub fn set(&self, idx: usize, v: f32) {
+        if idx < self.v.len() {
+            self.v[idx].store(v, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl VValUserData for AtomicFloatVec {
+    fn s(&self) -> String {
+        format!("$<AtomicFloatVec>")
+    }
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn clone_ud(&self) -> Box<dyn VValUserData> {
+        Box::new(self.clone())
+    }
+    fn as_thread_safe_usr(&mut self) -> Option<Box<dyn wlambda::threads::ThreadSafeUsr>> {
+        Some(Box::new(self.clone()))
+    }
+
+    fn call_method(&self, key: &str, env: &mut Env) -> Result<VVal, StackAction> {
+        let argv = env.argv_ref();
+        match key {
+            "get" => {
+                if argv.len() != 1 {
+                    return Err(StackAction::panic_str(
+                        "get method expects 1 arguments: index".to_string(),
+                        None,
+                        env.argv(),
+                    ));
+                }
+
+                let idx = argv[0].i() as usize;
+                Ok(if idx < self.v.len() {
+                    VVal::Flt(self.v[idx].load(std::sync::atomic::Ordering::Relaxed) as f64)
+                } else {
+                    VVal::Flt(0.0)
+                })
+            }
+            _ => Err(StackAction::panic_str(
+                format!("unknown method called: {}", key),
+                None,
+                env.argv(),
+            )),
+        }
+    }
+}
+
+impl wlambda::threads::ThreadSafeUsr for AtomicFloatVec {
+    fn to_vval(&self) -> VVal {
+        VVal::Usr(Box::new(AtomicFloatVec { v: self.v.clone() }))
+    }
+}
 
 /// This is mostly identical to the gain example, minus some fluff, and with a GUI.
 #[allow(dead_code)]
@@ -17,6 +87,11 @@ pub struct Midi2WLambda {
     wl_handle_stopper: RPCHandleStopper,
 
     gui_log_channel: AValChannel,
+
+    param_vval_vec: AtomicFloatVec,
+
+    task_queue: Option<Producer<M2WTask>>,
+//    task_queue2: Option<Producer<M2WTask>>,
 }
 
 #[derive(Params)]
@@ -37,16 +112,58 @@ pub struct Midi2WLambdaParams {
 
     #[persist = "wlambda-path"]
     wlambda_path: Arc<Mutex<String>>,
+
+    #[id = "l1_val"]
+    pub l1_val: FloatParam,
+    #[id = "l1_clr"]
+    pub l1_clr: FloatParam,
+    #[id = "l1_x"]
+    pub l1_x: FloatParam,
+
+    #[id = "l2_val"]
+    pub l2_val: FloatParam,
+    #[id = "l2_clr"]
+    pub l2_clr: FloatParam,
+    #[id = "l2_x"]
+    pub l2_x: FloatParam,
+
+    #[id = "l3_val"]
+    pub l3_val: FloatParam,
+    #[id = "l3_clr"]
+    pub l3_clr: FloatParam,
+    #[id = "l3_x"]
+    pub l3_x: FloatParam,
+
+    #[id = "l4_val"]
+    pub l4_val: FloatParam,
+    #[id = "l4_clr"]
+    pub l4_clr: FloatParam,
+    #[id = "l4_x"]
+    pub l4_x: FloatParam,
+
+    #[id = "l5_val"]
+    pub l5_val: FloatParam,
+    #[id = "l5_clr"]
+    pub l5_clr: FloatParam,
+    #[id = "l5_x"]
+    pub l5_x: FloatParam,
 }
 
 impl Default for Midi2WLambda {
     fn default() -> Self {
         let wl_handle = RPCHandle::new();
         let wl_handle_stopper = wl_handle.make_stopper_handle();
+
         Self {
             params: Arc::new(Midi2WLambdaParams::default()),
 
             gui_log_channel: AValChannel::new_direct(),
+
+            param_vval_vec: AtomicFloatVec::new(15),
+
+            task_queue: None,
+//            task_queue2: None,
+
             wl_handle,
             wl_handle_stopper,
         }
@@ -57,6 +174,79 @@ impl Default for Midi2WLambdaParams {
     fn default() -> Self {
         Self {
             editor_state: EguiState::from_size(1200, 500),
+
+            l1_val: FloatParam::new(
+                "Lamp1 Value",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l1_clr: FloatParam::new(
+                "Lamp1 Color",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l1_x: FloatParam::new("Lamp1 X", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+
+            l2_val: FloatParam::new(
+                "Lamp1 Value",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l2_clr: FloatParam::new(
+                "Lamp1 Color",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l2_x: FloatParam::new("Lamp1 X", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+            l3_val: FloatParam::new(
+                "Lamp1 Value",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l3_clr: FloatParam::new(
+                "Lamp1 Color",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l3_x: FloatParam::new("Lamp1 X", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+            l4_val: FloatParam::new(
+                "Lamp1 Value",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l4_clr: FloatParam::new(
+                "Lamp1 Color",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l4_x: FloatParam::new("Lamp1 X", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+            l5_val: FloatParam::new(
+                "Lamp1 Value",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l5_clr: FloatParam::new(
+                "Lamp1 Color",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_smoother(SmoothingStyle::Linear(5.0)),
+            l5_x: FloatParam::new("Lamp1 X", 0.0, FloatRange::Linear { min: 0.0, max: 1.0 })
+                .with_smoother(SmoothingStyle::Linear(5.0)),
+
             wlambda_code: Arc::new(Mutex::new(String::from("!(note, is_on) = @;\n"))),
             wlambda_path: Arc::new(Mutex::new(String::from("/home/weicon/midi2wlambda.wl"))),
             wlambda_init_code: Arc::new(Mutex::new(String::from(""))),
@@ -79,9 +269,112 @@ struct GUIState {
 
 impl GUIState {
     fn new() -> Self {
-        Self {
-            log: vec![],
-        }
+        Self { log: vec![] }
+    }
+}
+
+impl Midi2WLambda {
+    fn start_wlambda_executor(&mut self) {
+        let (mut prod, mut cons) = RingBuffer::new(1024);
+        let (mut prod2, mut cons2) = RingBuffer::new(1024);
+        self.task_queue = Some(prod);
+//        self.task_queue2 = Some(prod2);
+
+        let handle = self.wl_handle.clone();
+        let sender = self.wl_handle.clone();
+        let log = self.gui_log_channel.clone();
+        let param_vec = self.param_vval_vec.clone();
+
+        std::thread::spawn(move || {
+            eprintln!("started bg thread");
+            let mut wlctx = EvalContext::new_default();
+            handle.register_global_functions("worker", &mut wlctx);
+            let log2 = log.clone();
+            let log3 = log.clone();
+            wlctx.set_global_var(
+                "log",
+                &VValFun::new_fun(
+                    move |env: &mut Env, _argc: usize| {
+                        log.send(&env.arg(0));
+                        Ok(VVal::None)
+                    },
+                    Some(1),
+                    Some(1),
+                    false,
+                ),
+            );
+
+            wlctx.set_global_var("params", &VVal::Usr(Box::new(param_vec)));
+
+            wlctx.set_global_var(
+                "new_log_sender",
+                &VValFun::new_fun(
+                    move |env: &mut Env, _argc: usize| Ok(log2.fork_sender()),
+                    Some(0),
+                    Some(0),
+                    false,
+                ),
+            );
+            let _ = wlctx.eval("log :STARTUP_WLAMBDA");
+
+            let rr = wlctx.eval(
+                r#"
+                !:global on_midi = {||};
+                !:global update_midi_function = {!(code) = @;
+                    !func = std:eval code;
+                    .on_midi = unwrap func;
+                };
+            "#,
+            );
+            if let Err(e) = rr {
+                eprintln!("RR: {}", e);
+            }
+
+            wlambda::rpc_helper::rpc_handler_cb(
+                &mut wlctx,
+                &handle,
+                std::time::Duration::from_millis(10),
+                move || loop {
+                    let task = if let Ok(task) = cons.pop() {
+                        task
+                    } else if let Ok(task) = cons2.pop() {
+                        task
+                    } else {
+                        break;
+                    };
+
+                    eprintln!("bg thread task");
+                    match task {
+                        M2WTask::MIDI(x, o) => {
+                            let _ = sender
+                                .call("on_midi", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
+                        }
+                        M2WTask::InitCode(init_code, midi_code) => {
+                            let r = sender.eval(&init_code);
+                            log3.send(&VVal::new_str_mv(format!("Initialized! {}", r.s())));
+
+                            let r = sender.call(
+                                "update_midi_function",
+                                VVal::vec1(VVal::new_str(&midi_code)),
+                            );
+                            log3.send(&VVal::new_str_mv(format!(
+                                "Updated MIDI Function! {}",
+                                r.s()
+                            )));
+                        }
+                        M2WTask::UpdateCode(code) => {
+                            let r = sender
+                                .call("update_midi_function", VVal::vec1(VVal::new_str(&code)));
+                            log3.send(&VVal::new_str_mv(format!(
+                                "Updated MIDI Function! {}",
+                                r.s()
+                            )));
+                        }
+                    };
+                },
+            );
+            eprintln!("end bg thread");
+        });
     }
 }
 
@@ -111,101 +404,17 @@ impl Plugin for Midi2WLambda {
     const SAMPLE_ACCURATE_AUTOMATION: bool = true;
 
     type SysExMessage = ();
-    type BackgroundTask = M2WTask;
+    type BackgroundTask = ();
 
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
 
-    fn task_executor(&mut self) -> TaskExecutor<Self> {
-        let handle = self.wl_handle.clone();
-        let log = self.gui_log_channel.clone();
-
-        let comm_chan = AValChannel::new_direct();
-        let recv = comm_chan.clone();
-
-        std::thread::spawn(move || {
-            let mut wlctx = EvalContext::new_default();
-            handle.register_global_functions("worker", &mut wlctx);
-            let log2 = log.clone();
-            wlctx.set_global_var(
-                "log",
-                &VValFun::new_fun(
-                    move |env: &mut Env, _argc: usize| {
-                        log.send(&env.arg(0));
-                        Ok(VVal::None)
-                    },
-                    Some(1),
-                    Some(1),
-                    false,
-                ),
-            );
-
-            wlctx.set_global_var(
-                "new_log_sender",
-                &VValFun::new_fun(
-                    move |env: &mut Env, _argc: usize| Ok(log2.fork_sender()),
-                    Some(0),
-                    Some(0),
-                    false,
-                ),
-            );
-            let _ = wlctx.eval("log :STARTUP_WLAMBDA");
-
-            let rr = wlctx.eval(
-                r#"
-                !:global on_midi = {||};
-                !:global update_midi_function = {!(code) = @;
-                    !func = std:eval code;
-                    .on_midi = unwrap func;
-                };
-            "#,
-            );
-            if let Err(e) = rr {
-                eprintln!("RR: {}", e);
-            }
-
-            wlambda::rpc_helper::rpc_handler(
-                &mut wlctx,
-                &handle,
-                std::time::Duration::from_millis(100),
-            );
-        });
-
-        let sender = self.wl_handle.clone();
-        let log = self.gui_log_channel.clone();
-
-        Box::new(move |bg: M2WTask| match bg {
-            M2WTask::MIDI(x, o) => {
-                eprintln!("MIDI {} {}", x, o);
-                let _ = sender.call("on_midi", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
-            }
-            M2WTask::InitCode(init_code, midi_code) => {
-                let r = sender.eval(&init_code);
-                log.send(&VVal::new_str_mv(format!("Initialized! {}", r.s())));
-
-                let r = sender.call(
-                    "update_midi_function",
-                    VVal::vec1(VVal::new_str(&midi_code)),
-                );
-                log.send(&VVal::new_str_mv(format!(
-                    "Updated MIDI Function! {}",
-                    r.s()
-                )));
-            }
-            M2WTask::UpdateCode(code) => {
-                let r = sender.call("update_midi_function", VVal::vec1(VVal::new_str(&code)));
-                log.send(&VVal::new_str_mv(format!(
-                    "Updated MIDI Function! {}",
-                    r.s()
-                )));
-            }
-        })
-    }
-
-    fn editor(&mut self, async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
+    fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let chan = self.gui_log_channel.clone();
+        eprintln!("CREATE ERDI");
+//        let queue2 = self.task_queue2.take();
 
         create_egui_editor(
             self.params.editor_state.clone(),
@@ -235,13 +444,12 @@ impl Plugin for Midi2WLambda {
 
                                             if let Ok(txt) = std::fs::read_to_string(&*init_path) {
                                                 *init_code = txt;
-
-                                                async_executor.execute_background(
-                                                    M2WTask::InitCode(
-                                                        init_code.clone(),
-                                                        midi_code.clone(),
-                                                    ),
-                                                );
+//                                                if let Some(q) = queue2.as_mut() {
+//                                                    let _ = q.push(M2WTask::InitCode(
+//                                                        init_code.clone(),
+//                                                        midi_code.clone(),
+//                                                    ));
+//                                                }
                                             }
                                         }
                                     }
@@ -256,8 +464,9 @@ impl Plugin for Midi2WLambda {
                                 if let Ok(mut code) = params.wlambda_code.lock() {
                                     if let Ok(txt) = std::fs::read_to_string(&*path) {
                                         *code = txt;
-                                        async_executor
-                                            .execute_background(M2WTask::UpdateCode(code.clone()));
+//                                        if let Some(q) = queue2.as_mut() {
+//                                            let _ = q.push(M2WTask::UpdateCode(code.clone()));
+//                                        }
                                     }
                                 }
                             }
@@ -297,7 +506,7 @@ impl Plugin for Midi2WLambda {
                             }
 
                             let log_str = state.log.join("\n");
-                            let mut llstr : &str = &log_str;
+                            let mut llstr: &str = &log_str;
 
                             egui::ScrollArea::vertical()
                                 .id_source("log")
@@ -358,10 +567,14 @@ impl Plugin for Midi2WLambda {
     fn initialize(
         &mut self,
         _audio_io_layout: &AudioIOLayout,
-        buffer_config: &BufferConfig,
+        _buffer_config: &BufferConfig,
         _context: &mut impl InitContext<Self>,
     ) -> bool {
         true
+    }
+
+    fn reset(&mut self) {
+        self.start_wlambda_executor();
     }
 
     fn process(
@@ -371,14 +584,38 @@ impl Plugin for Midi2WLambda {
         context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let mut next_event = context.next_event();
+        let params = self.params.clone();
+        self.param_vval_vec.set(0, params.l1_val.value());
+        self.param_vval_vec.set(1, params.l1_clr.value());
+        self.param_vval_vec.set(2, params.l1_x.value());
+
+        self.param_vval_vec.set(3, params.l2_val.value());
+        self.param_vval_vec.set(4, params.l2_clr.value());
+        self.param_vval_vec.set(5, params.l2_x.value());
+
+        self.param_vval_vec.set(6, params.l3_val.value());
+        self.param_vval_vec.set(7, params.l3_clr.value());
+        self.param_vval_vec.set(8, params.l3_x.value());
+
+        self.param_vval_vec.set(9, params.l4_val.value());
+        self.param_vval_vec.set(10, params.l4_clr.value());
+        self.param_vval_vec.set(11, params.l4_x.value());
+
+        self.param_vval_vec.set(12, params.l5_val.value());
+        self.param_vval_vec.set(13, params.l5_clr.value());
+        self.param_vval_vec.set(14, params.l5_x.value());
 
         while let Some(event) = next_event {
             match event {
                 NoteEvent::NoteOn { note, velocity, .. } => {
-                    context.execute_background(M2WTask::MIDI(note as i64, true));
+                    if let Some(q) = self.task_queue.as_mut() {
+                        let _ = q.push(M2WTask::MIDI(note as i64, true));
+                    }
                 }
                 NoteEvent::NoteOff { note, .. } => {
-                    context.execute_background(M2WTask::MIDI(note as i64, false));
+                    if let Some(q) = self.task_queue.as_mut() {
+                        let _ = q.push(M2WTask::MIDI(note as i64, false));
+                    }
                 }
                 NoteEvent::PolyVolume { note, gain, .. } => {}
                 _ => (),
