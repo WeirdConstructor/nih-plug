@@ -84,14 +84,14 @@ pub struct Midi2WLambda {
     params: Arc<Midi2WLambdaParams>,
 
     wl_handle: RPCHandle,
-    wl_handle_stopper: RPCHandleStopper,
+    wl_handle_stopper: Option<RPCHandleStopper>,
 
     gui_log_channel: AValChannel,
 
     param_vval_vec: AtomicFloatVec,
 
     task_queue: Option<Producer<M2WTask>>,
-//    task_queue2: Option<Producer<M2WTask>>,
+    task_queue2: Arc<Mutex<Option<Producer<M2WTask>>>>,
 }
 
 #[derive(Params)]
@@ -152,7 +152,6 @@ pub struct Midi2WLambdaParams {
 impl Default for Midi2WLambda {
     fn default() -> Self {
         let wl_handle = RPCHandle::new();
-        let wl_handle_stopper = wl_handle.make_stopper_handle();
 
         Self {
             params: Arc::new(Midi2WLambdaParams::default()),
@@ -162,10 +161,10 @@ impl Default for Midi2WLambda {
             param_vval_vec: AtomicFloatVec::new(15),
 
             task_queue: None,
-//            task_queue2: None,
+            task_queue2: Arc::new(Mutex::new(None)),
 
             wl_handle,
-            wl_handle_stopper,
+            wl_handle_stopper: None,
         }
     }
 }
@@ -275,13 +274,20 @@ impl GUIState {
 
 impl Midi2WLambda {
     fn start_wlambda_executor(&mut self) {
+        let wl_handle = RPCHandle::new();
+        let wl_handle_stopper = wl_handle.make_stopper_handle();
+        self.wl_handle = wl_handle;
+        self.wl_handle_stopper = Some(wl_handle_stopper);
+
         let (mut prod, mut cons) = RingBuffer::new(1024);
-        let (mut prod2, mut cons2) = RingBuffer::new(1024);
         self.task_queue = Some(prod);
-//        self.task_queue2 = Some(prod2);
+        let (mut prod2, mut cons2) = RingBuffer::new(1024);
+        if let Ok(mut q) = self.task_queue2.lock() {
+            let _ = std::mem::replace(&mut *q, Some(prod2));
+        }
+        eprintln!("REPLACE");
 
         let handle = self.wl_handle.clone();
-        let sender = self.wl_handle.clone();
         let log = self.gui_log_channel.clone();
         let param_vec = self.param_vval_vec.clone();
 
@@ -330,11 +336,17 @@ impl Midi2WLambda {
                 eprintln!("RR: {}", e);
             }
 
+            let mut rrr = 0;
             wlambda::rpc_helper::rpc_handler_cb(
                 &mut wlctx,
                 &handle,
                 std::time::Duration::from_millis(10),
-                move || loop {
+                move |wlctx| loop {
+                    rrr += 1;
+                    if rrr % 100 == 0 {
+                        eprintln!("LOOP RUNNING {:?}", std::thread::current().id());
+                    };
+
                     let task = if let Ok(task) = cons.pop() {
                         task
                     } else if let Ok(task) = cons2.pop() {
@@ -343,32 +355,42 @@ impl Midi2WLambda {
                         break;
                     };
 
-                    eprintln!("bg thread task");
                     match task {
                         M2WTask::MIDI(x, o) => {
-                            let _ = sender
-                                .call("on_midi", VVal::vec2(VVal::Int(x as i64), VVal::Bol(o)));
+                            if let Some(on_midi) = wlctx.get_global_var("on_midi") {
+                                let _ = wlctx.call(&on_midi, &[VVal::Int(x as i64), VVal::Bol(o)]);
+                            }
                         }
                         M2WTask::InitCode(init_code, midi_code) => {
-                            let r = sender.eval(&init_code);
-                            log3.send(&VVal::new_str_mv(format!("Initialized! {}", r.s())));
+                            eprintln!("UPDATE CODE!");
+                            let r = wlctx.eval(&init_code);
+                            log3.send(&VVal::new_str_mv(format!("Initialized! {:?}", r)));
 
-                            let r = sender.call(
-                                "update_midi_function",
-                                VVal::vec1(VVal::new_str(&midi_code)),
-                            );
-                            log3.send(&VVal::new_str_mv(format!(
-                                "Updated MIDI Function! {}",
-                                r.s()
-                            )));
+                            if let Some(update_midi_function) =
+                                wlctx.get_global_var("update_midi_function")
+                            {
+                                let r = wlctx.call(
+                                    &update_midi_function,
+                                    &[VVal::new_str(&midi_code)],
+                                );
+                                log3.send(&VVal::new_str_mv(format!(
+                                    "Updated MIDI Function! {:?}",
+                                    r
+                                )));
+                            }
                         }
                         M2WTask::UpdateCode(code) => {
-                            let r = sender
-                                .call("update_midi_function", VVal::vec1(VVal::new_str(&code)));
-                            log3.send(&VVal::new_str_mv(format!(
-                                "Updated MIDI Function! {}",
-                                r.s()
-                            )));
+                            eprintln!("UPDATE CODE!");
+                            if let Some(update_midi_function) =
+                                wlctx.get_global_var("update_midi_function")
+                            {
+                                let r = wlctx.call(&update_midi_function, &[VVal::new_str(&code)]);
+
+                                log3.send(&VVal::new_str_mv(format!(
+                                    "Updated MIDI Function! {:?}",
+                                    r
+                                )));
+                            }
                         }
                     };
                 },
@@ -413,8 +435,8 @@ impl Plugin for Midi2WLambda {
     fn editor(&mut self, _async_executor: AsyncExecutor<Self>) -> Option<Box<dyn Editor>> {
         let params = self.params.clone();
         let chan = self.gui_log_channel.clone();
+        let mut queue2 = self.task_queue2.clone();
         eprintln!("CREATE ERDI");
-//        let queue2 = self.task_queue2.take();
 
         create_egui_editor(
             self.params.editor_state.clone(),
@@ -444,12 +466,15 @@ impl Plugin for Midi2WLambda {
 
                                             if let Ok(txt) = std::fs::read_to_string(&*init_path) {
                                                 *init_code = txt;
-//                                                if let Some(q) = queue2.as_mut() {
-//                                                    let _ = q.push(M2WTask::InitCode(
-//                                                        init_code.clone(),
-//                                                        midi_code.clone(),
-//                                                    ));
-//                                                }
+                                                if let Ok(mut q) = queue2.lock() {
+                                                    if let Some(q) = q.as_mut() {
+                                                        println!("PUSHTASK");
+                                                        let _ = q.push(M2WTask::InitCode(
+                                                            init_code.clone(),
+                                                            midi_code.clone(),
+                                                        ));
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -464,9 +489,11 @@ impl Plugin for Midi2WLambda {
                                 if let Ok(mut code) = params.wlambda_code.lock() {
                                     if let Ok(txt) = std::fs::read_to_string(&*path) {
                                         *code = txt;
-//                                        if let Some(q) = queue2.as_mut() {
-//                                            let _ = q.push(M2WTask::UpdateCode(code.clone()));
-//                                        }
+                                        if let Ok(mut q) = queue2.lock() {
+                                            if let Some(q) = q.as_mut() {
+                                                let _ = q.push(M2WTask::UpdateCode(code.clone()));
+                                            }
+                                        }
                                     }
                                 }
                             }
